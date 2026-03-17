@@ -5,6 +5,7 @@ from telegram.ext import Application
 import asyncio
 from datetime import datetime
 import logging
+from telegram.error import TelegramError
 
 # Настройка логирования
 logging.basicConfig(
@@ -20,40 +21,41 @@ VK_GROUP_TOKEN = os.getenv("VK_GROUP_TOKEN")
 VK_GROUP_ID = int(os.getenv("VK_GROUP_ID"))
 
 async def fetch_all_telegram_posts():
-    """Получает все посты из Telegram-канала."""
+    """Получает все посты из Telegram-канала с использованием chat_id."""
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
-    offset = 0
-    limit = 100
     all_posts = []
+    last_message_id = None
     
-    while True:
-        try:
-            updates = await app.bot.get_updates(
-                offset=offset,
-                limit=limit,
-                allowed_updates=["channel_post"]
+    try:
+        while True:
+            # Получаем сообщения из канала
+            updates = await app.bot.get_chat_history(
+                chat_id=TELEGRAM_CHANNEL_ID,
+                limit=100,
+                offset_id=last_message_id
             )
             
             if not updates:
                 break
             
-            for update in updates:
-                if update.channel_post:
-                    all_posts.append(update.channel_post)
-                    offset = update.update_id + 1
+            for message in updates:
+                all_posts.append(message)
+                last_message_id = message.message_id
             
             await asyncio.sleep(1)  # Пауза для API Telegram
             
-        except Exception as e:
-            logger.error(f"Ошибка при получении постов: {e}")
-            break
+    except TelegramError as e:
+        logger.error(f"Ошибка при получении постов из Telegram: {e}")
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка: {e}")
     
     return all_posts
 
 def upload_photo_to_vk(photo_url: str) -> dict:
     """Загружает фото во ВКонтакте и возвращает данные."""
     try:
+        # Получаем URL для загрузки
         params = {
             "access_token": VK_GROUP_TOKEN,
             "v": "5.131",
@@ -66,8 +68,14 @@ def upload_photo_to_vk(photo_url: str) -> dict:
         )
         response.raise_for_status()
         
-        upload_url = response.json()["response"]["upload_url"]
+        result = response.json()
+        if "error" in result:
+            logger.error(f"Ошибка VK API: {result['error']['error_msg']}")
+            return None
+            
+        upload_url = result["response"]["upload_url"]
         
+        # Скачиваем и загружаем фото
         photo_response = requests.get(photo_url, timeout=30)
         photo_response.raise_for_status()
         files = {"photo": ("photo.jpg", photo_response.content, "image/jpeg")}
@@ -76,6 +84,7 @@ def upload_photo_to_vk(photo_url: str) -> dict:
         upload_response.raise_for_status()
         data = upload_response.json()
         
+        # Сохраняем фото на стене
         save_params = {
             "access_token": VK_GROUP_TOKEN,
             "v": "5.131",
@@ -91,9 +100,18 @@ def upload_photo_to_vk(photo_url: str) -> dict:
         )
         save_response.raise_for_status()
         
-        return save_response.json()["response"][0]
+        save_result = save_response.json()
+        if "error" in save_result:
+            logger.error(f"Ошибка сохранения фото: {save_result['error']['error_msg']}")
+            return None
+            
+        return save_result["response"][0]
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Сетевая ошибка при загрузке фото: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Ошибка загрузки фото {photo_url}: {e}")
+        logger.error(f"Неожиданная ошибка при загрузке фото: {e}")
         return None
 
 def upload_video_to_vk(video_url: str, title: str = "Video") -> dict:
@@ -103,9 +121,11 @@ def upload_video_to_vk(video_url: str, title: str = "Video") -> dict:
         params = {
             "access_token": VK_GROUP_TOKEN,
             "v": "5.131",
-            "name": title,
-            "group_id": VK_GROUP_ID
+            "name": title[:100],  # VK ограничивает название 100 символами
+            "group_id": VK_GROUP_ID,
+            "description": f"Видео из Telegram от {datetime.now().strftime('%d.%m.%Y')}"
         }
+        
         response = requests.get(
             "https://api.vk.com/method/video.save",
             params=params,
@@ -113,33 +133,49 @@ def upload_video_to_vk(video_url: str, title: str = "Video") -> dict:
         )
         response.raise_for_status()
         
-        if "error" in response.json():
-            error_msg = response.json()["error"]["error_msg"]
-            logger.error(f"Ошибка получения URL для видео: {error_msg}")
+        result = response.json()
+        if "error" in result:
+            logger.error(f"Ошибка получения URL для видео: {result['error']['error_msg']}")
             return None
         
-        upload_data = response.json()["response"]
+        upload_data = result["response"]
+        
+        # Проверяем наличие upload_url
+        if "upload_url" not in upload_data:
+            logger.error("Нет upload_url в ответе VK API")
+            return None
+            
         upload_url = upload_data["upload_url"]
         
         # Скачиваем видео потоково
         video_response = requests.get(video_url, stream=True, timeout=300)
         video_response.raise_for_status()
         
-        files = {"video_file": ("video.mp4", video_response.iter_content(1024*1024), "video/mp4")}
-        
         # Загружаем видео
+        files = {"video_file": ("video.mp4", video_response.raw, "video/mp4")}
         upload_response = requests.post(upload_url, files=files, timeout=600)
         upload_response.raise_for_status()
-        result = upload_response.json()
         
-        if "error" in result:
-            error_msg = result["error"]["error_msg"]
-            logger.error(f"Ошибка загрузки видео: {error_msg}")
+        upload_result = upload_response.json()
+        
+        if "error" in upload_result:
+            logger.error(f"Ошибка загрузки видео: {upload_result['error']['error_msg']}")
             return None
         
-        return upload_data
+        # Возвращаем данные с правильными ключами
+        return {
+            "owner_id": upload_data["owner_id"],
+            "video_id": upload_data["video_id"]
+        }
+        
+    except requests.exceptions.Timeout:
+        logger.error(f"Таймаут при загрузке видео {video_url}")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Сетевая ошибка при загрузке видео: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Критическая ошибка загрузки видео {video_url}: {e}")
+        logger.error(f"Критическая ошибка загрузки видео: {e}")
         return None
 
 def format_telegram_date(timestamp: int) -> str:
@@ -165,6 +201,7 @@ def publish_to_vk(text: str, media_urls: list, video_url: str = None, telegram_d
                 photo_data = upload_photo_to_vk(url)
                 if photo_data:
                     attachments.append(f"photo{photo_data['owner_id']}_{photo_data['id']}")
+                    logger.info(f"Фото {url} успешно загружено")
             except Exception as e:
                 logger.error(f"Ошибка обработки фото {url}: {e}")
     
@@ -175,14 +212,16 @@ def publish_to_vk(text: str, media_urls: list, video_url: str = None, telegram_d
             if video_data:
                 video_attachment = f"video{video_data['owner_id']}_{video_data['video_id']}"
                 attachments.append(video_attachment)
+                logger.info(f"Видео успешно загружено")
         except Exception as e:
             logger.error(f"Ошибка обработки видео {video_url}: {e}")
 
     params = {
         "access_token": VK_GROUP_TOKEN,
         "v": "5.131",
-        "owner_id": -VK_GROUP_ID,  # Отрицательное для групп
+        "owner_id": -abs(VK_GROUP_ID),  # Отрицательное для групп
         "message": text,
+        "from_group": 1  # Публикуем от имени группы
     }
 
     if attachments:
@@ -192,7 +231,7 @@ def publish_to_vk(text: str, media_urls: list, video_url: str = None, telegram_d
         response = requests.post(
             "https://api.vk.com/method/wall.post",
             data=params,
-            timeout=(30, 60)  # Таймауты: соединение 30 с, чтение 60 с
+            timeout=(30, 120)
         )
         response.raise_for_status()
         result = response.json()
@@ -202,10 +241,12 @@ def publish_to_vk(text: str, media_urls: list, video_url: str = None, telegram_d
             logger.error(f"Ошибка публикации поста: {error_msg}")
             return False
         
-
-        logger.info("Пост успешно опубликован во ВКонтакте!")
+        logger.info("✅ Пост успешно опубликован во ВКонтакте!")
         return True
 
+    except requests.exceptions.Timeout:
+        logger.error("Таймаут при публикации поста")
+        return False
     except requests.exceptions.RequestException as e:
         logger.error(f"Сетевая ошибка при публикации поста: {e}")
         return False
@@ -213,49 +254,84 @@ def publish_to_vk(text: str, media_urls: list, video_url: str = None, telegram_d
         logger.error(f"Неожиданная ошибка при публикации поста: {e}")
         return False
 
+async def process_media(post):
+    """Обрабатывает медиафайлы из поста."""
+    media_urls = []
+    video_url = None
+    
+    try:
+        # Обрабатываем фото
+        if hasattr(post, 'photo') and post.photo:
+            try:
+                # Берем самую большую версию фото
+                photo = post.photo[-1]
+                file = await photo.get_file()
+                file_path = file.file_path
+                # Полный URL для скачивания
+                media_urls.append(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}")
+                logger.info(f"Найдено фото: {file_path}")
+            except Exception as e:
+                logger.warning(f"Не удалось получить фото: {e}")
+        
+        # Обрабатываем видео
+        if hasattr(post, 'video') and post.video:
+            try:
+                video = post.video
+                file = await video.get_file()
+                file_path = file.file_path
+                video_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+                logger.info(f"Найдено видео: {file_path}")
+            except Exception as e:
+                logger.warning(f"Не удалось получить видео: {e}")
+                
+    except Exception as e:
+        logger.error(f"Ошибка при обработке медиа: {e}")
+    
+    return media_urls, video_url
+
 async def main():
-    logger.info("Начинаем перенос старых постов из Telegram во ВКонтакте...")
+    logger.info("🚀 Начинаем перенос старых постов из Telegram во ВКонтакте...")
+    
+    # Проверка наличия токенов
+    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, VK_GROUP_TOKEN, VK_GROUP_ID]):
+        logger.error("❌ Не все переменные окружения установлены!")
+        return
+    
     posts = await fetch_all_telegram_posts()
-    logger.info(f"Найдено {len(posts)} постов для переноса")
+    logger.info(f"📊 Найдено {len(posts)} постов для переноса")
+
+    if not posts:
+        logger.info("Нет постов для переноса")
+        return
 
     success_count = 0
     error_count = 0
 
     for i, post in enumerate(posts, 1):
-        logger.info(f"Обрабатываем пост {i}/{len(posts)}")
+        logger.info(f"📝 Обрабатываем пост {i}/{len(posts)}")
         
+        # Получаем текст поста
         text = post.text or post.caption or ""
-        media_urls = []
-        video_url = None
-        telegram_date = post.date  # Получаем дату публикации из Telegram
+        telegram_date = post.date
+        
+        # Обрабатываем медиа
+        media_urls, video_url = await process_media(post)
+        
+        logger.info(f"Текст: {text[:50]}..." if text else "Без текста")
+        logger.info(f"Медиа: {len(media_urls)} фото, видео: {'да' if video_url else 'нет'}")
 
-        # Извлекаем фото
-        if post.photo:
-            try:
-                photo = post.photo[-1]
-                file = await photo.get_file()
-                media_urls.append(file.file_path)
-            except Exception as e:
-                logger.warning(f"Не удалось получить фото для поста {i}: {e}")
-
-        # Извлекаем видео
-        if post.video:
-            try:
-                video = post.video
-                file = await video.get_file()
-                video_url = file.file_path
-            except Exception as e:
-                logger.warning(f"Не удалось получить видео для поста {i}: {e}")
-
+        # Публикуем в VK
         success = publish_to_vk(text, media_urls, video_url, telegram_date)
+        
         if success:
             success_count += 1
         else:
             error_count += 1
 
-        await asyncio.sleep(3)  # Увеличенная пауза для видео
+        # Увеличенная пауза для видео
+        await asyncio.sleep(5)
 
-    logger.info(f"Перенос завершён! Успешно: {success_count}, с ошибками: {error_count}")
+    logger.info(f"✨ Перенос завершён! Успешно: {success_count}, с ошибками: {error_count}")
 
 if __name__ == "__main__":
     asyncio.run(main())
