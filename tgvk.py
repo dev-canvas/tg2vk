@@ -1,65 +1,215 @@
 import os
+import json
 import requests
 from telegram import Update
-from telegram.ext import Application
-import asyncio
-from datetime import datetime
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import logging
-from telegram.error import TelegramError
+from datetime import datetime
+import asyncio
+import shutil
+import zipfile
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
 
 # Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicFormat = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+logging.basicConfig(level=logging.INFO, format=logging.basicFormat)
 logger = logging.getLogger(__name__)
 
-# Конфигурация (замените на свои значения)
+# Конфигурация
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID"))
 VK_GROUP_TOKEN = os.getenv("VK_GROUP_TOKEN")
-VK_GROUP_ID = int(os.getenv("VK_GROUP_ID"))
+VK_GROUP_ID = os.getenv("VK_GROUP_ID")
 
-async def fetch_all_telegram_posts():
-    """Получает все посты из Telegram-канала с использованием chat_id."""
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+# Создаем директорию для временных файлов
+TEMP_DIR = "data\temp_media"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    help_text = (
+        "🤖 <b>Бот для переноса постов из Telegram в VK</b>\n\n"
+        "📤 <b>Как использовать:</b>\n"
+        "1. Экспортируйте чат из Telegram Desktop:\n"
+        "   - Откройте канал/чат\n"
+        "   - Нажмите ⋮ → 'Экспортировать историю чата'\n"
+        "   - Выберите формат JSON\n"
+        "   - Скачайте архив\n\n"
+        "2. Отправьте мне ZIP-архив с экспортированными данными\n\n"
+        "3. Я обработаю файл и перенесу посты в VK\n\n"
+        "📋 <b>Команды:</b>\n"
+        "/start - Показать это сообщение\n"
+        "/stats - Статистика обработки\n"
+        "/cancel - Отменить текущую обработку"
+    )
+    await update.message.reply_text(help_text, parse_mode='HTML')
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает статистику текущей обработки"""
+    if 'stats' in context.user_data:
+        stats_data = context.user_data['stats']
+        text = (
+            f"📊 <b>Статистика обработки:</b>\n\n"
+            f"Всего постов: {stats_data.get('total', 0)}\n"
+            f"Обработано: {stats_data.get('processed', 0)}\n"
+            f"Успешно: {stats_data.get('success', 0)}\n"
+            f"Ошибок: {stats_data.get('errors', 0)}"
+        )
+    else:
+        text = "Нет активной обработки. Отправьте ZIP-архив с экспортом"
     
-    all_posts = []
-    last_message_id = None
+    await update.message.reply_text(text, parse_mode='HTML')
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отменяет текущую обработку"""
+    if 'processing' in context.user_data:
+        context.user_data['processing'] = False
+        await update.message.reply_text("✅ Обработка отменена")
+    else:
+        await update.message.reply_text("Нет активной обработки")
+
+def extract_zip(zip_path: str, extract_to: str) -> str:
+    """Распаковывает ZIP архив и возвращает путь к result.json"""
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_to)
+        
+        # Ищем result.json в распакованных файлах
+        for root, dirs, files in os.walk(extract_to):
+            if 'result.json' in files:
+                return os.path.join(root, 'result.json')
+        
+        raise FileNotFoundError("result.json не найден в архиве")
+    except zipfile.BadZipFile:
+        raise Exception("Файл поврежден или не является ZIP-архивом")
+
+def parse_telegram_export(json_path: str) -> List[Dict]:
+    """Парсит экспортированный JSON из Telegram"""
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        raise Exception("Не удалось прочитать JSON файл. Возможно, он поврежден")
+    
+    messages = []
+    
+    # Проверяем структуру JSON
+    if isinstance(data, dict):
+        if 'messages' in data:
+            # Стандартный формат экспорта Telegram
+            for msg in data['messages']:
+                if msg.get('type') == 'message' and msg.get('text'):
+                    messages.append(msg)
+        elif 'chats' in data and 'list' in data['chats']:
+            # Альтернативный формат
+            for chat in data['chats']['list']:
+                if 'messages' in chat:
+                    for msg in chat['messages']:
+                        if msg.get('text'):
+                            messages.append(msg)
+    elif isinstance(data, list):
+        # Если данные - это просто список сообщений
+        messages = [msg for msg in data if msg.get('text')]
+    
+    logger.info(f"Найдено {len(messages)} сообщений в JSON")
+    return messages
+
+def extract_media_from_message(msg: Dict, export_dir: str) -> Tuple[List[str], Optional[str]]:
+    """Извлекает пути к медиафайлам из сообщения"""
+    media_paths = []
+    video_path = None
+    
+    # Путь к папке с файлами
+    files_dir = os.path.join(export_dir, 'files')
+    
+    if not os.path.exists(files_dir):
+        logger.warning(f"Папка files не найдена: {files_dir}")
+        return media_paths, video_path
+    
+    # Проверяем наличие фото
+    if 'photo' in msg and msg['photo']:
+        photo_list = msg['photo']
+        if isinstance(photo_list, str):
+            photo_list = [photo_list]
+        
+        for photo in photo_list:
+            if isinstance(photo, str):
+                photo_path = os.path.join(files_dir, photo)
+                if os.path.exists(photo_path):
+                    media_paths.append(photo_path)
+    
+    # Проверяем наличие файлов
+    if 'file' in msg and msg['file']:
+        file_path = os.path.join(files_dir, msg['file'])
+        if os.path.exists(file_path):
+            file_ext = os.path.splitext(file_path)[1].lower()
+            video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v']
+            photo_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']
+            
+            if file_ext in video_extensions:
+                video_path = file_path
+            elif file_ext in photo_extensions:
+                media_paths.append(file_path)
+    
+    # Проверяем медиа в разных полях
+    if 'media_type' in msg:
+        if msg['media_type'] in ['video_file', 'video', 'animation'] and 'file' in msg:
+            file_path = os.path.join(files_dir, msg['file'])
+            if os.path.exists(file_path):
+                video_path = file_path
+        elif msg['media_type'] in ['photo', 'sticker', 'animated_webp', 'voice'] and 'file' in msg:
+            file_path = os.path.join(files_dir, msg['file'])
+            if os.path.exists(file_path):
+                media_paths.append(file_path)
+    
+    return media_paths, video_path
+
+def format_message_text(msg: Dict) -> str:
+    """Форматирует текст сообщения"""
+    text = ""
+    
+    if isinstance(msg.get('text'), str):
+        text = msg['text']
+    elif isinstance(msg.get('text'), list):
+        # Обрабатываем форматированный текст
+        for part in msg['text']:
+            if isinstance(part, str):
+                text += part
+            elif isinstance(part, dict) and 'text' in part:
+                text += part['text']
+    
+    # Ограничиваем длину текста для VK
+    if len(text) > 9000:
+        text = text[:9000] + "...\n\n[Текст обрезан из-за ограничений VK]"
+    
+    return text.strip()
+
+def format_date(date_str: str) -> str:
+    """Форматирует дату из Telegram"""
+    if not date_str:
+        return ""
     
     try:
-        while True:
-            # Получаем сообщения из канала
-            updates = await app.bot.get_chat_history(
-                chat_id=TELEGRAM_CHANNEL_ID,
-                limit=100,
-                offset_id=last_message_id
-            )
-            
-            if not updates:
-                break
-            
-            for message in updates:
-                all_posts.append(message)
-                last_message_id = message.message_id
-            
-            await asyncio.sleep(1)  # Пауза для API Telegram
-            
-    except TelegramError as e:
-        logger.error(f"Ошибка при получении постов из Telegram: {e}")
-    except Exception as e:
-        logger.error(f"Неожиданная ошибка: {e}")
-    
-    return all_posts
+        # Пробуем разные форматы даты
+        if 'T' in date_str:
+            # ISO формат: 2024-01-15T14:30:00
+            dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+            return dt.strftime("%d.%m.%Y %H:%M")
+        else:
+            # Простой формат: 2024-01-15 14:30:00
+            dt = datetime.strptime(date_str[:19], '%Y-%m-%d %H:%M:%S')
+            return dt.strftime("%d.%m.%Y %H:%M")
+    except:
+        return date_str
 
-def upload_photo_to_vk(photo_url: str) -> dict:
-    """Загружает фото во ВКонтакте и возвращает данные."""
+def upload_photo_to_vk(photo_path: str) -> Optional[str]:
+    """Загружает фото в VK"""
     try:
         # Получаем URL для загрузки
         params = {
             "access_token": VK_GROUP_TOKEN,
             "v": "5.131",
-            "group_id": VK_GROUP_ID
+            "group_id": abs(int(VK_GROUP_ID))
         }
         response = requests.get(
             "https://api.vk.com/method/photos.getWallUploadServer",
@@ -72,23 +222,21 @@ def upload_photo_to_vk(photo_url: str) -> dict:
         if "error" in result:
             logger.error(f"Ошибка VK API: {result['error']['error_msg']}")
             return None
-            
+        
         upload_url = result["response"]["upload_url"]
         
-        # Скачиваем и загружаем фото
-        photo_response = requests.get(photo_url, timeout=30)
-        photo_response.raise_for_status()
-        files = {"photo": ("photo.jpg", photo_response.content, "image/jpeg")}
+        # Загружаем фото
+        with open(photo_path, 'rb') as f:
+            files = {"photo": f}
+            upload_response = requests.post(upload_url, files=files, timeout=60)
+            upload_response.raise_for_status()
+            data = upload_response.json()
         
-        upload_response = requests.post(upload_url, files=files, timeout=60)
-        upload_response.raise_for_status()
-        data = upload_response.json()
-        
-        # Сохраняем фото на стене
+        # Сохраняем фото
         save_params = {
             "access_token": VK_GROUP_TOKEN,
             "v": "5.131",
-            "group_id": VK_GROUP_ID,
+            "group_id": abs(int(VK_GROUP_ID)),
             "photo": data["photo"],
             "server": data["server"],
             "hash": data["hash"]
@@ -104,26 +252,27 @@ def upload_photo_to_vk(photo_url: str) -> dict:
         if "error" in save_result:
             logger.error(f"Ошибка сохранения фото: {save_result['error']['error_msg']}")
             return None
-            
-        return save_result["response"][0]
+        
+        photo_data = save_result["response"][0]
+        return f"photo{photo_data['owner_id']}_{photo_data['id']}"
         
     except requests.exceptions.RequestException as e:
         logger.error(f"Сетевая ошибка при загрузке фото: {e}")
         return None
     except Exception as e:
-        logger.error(f"Неожиданная ошибка при загрузке фото: {e}")
+        logger.error(f"Ошибка загрузки фото {photo_path}: {e}")
         return None
 
-def upload_video_to_vk(video_url: str, title: str = "Video") -> dict:
-    """Загружает видео во ВКонтакте и возвращает данные."""
+def upload_video_to_vk(video_path: str, title: str = "Video") -> Optional[str]:
+    """Загружает видео в VK"""
     try:
-        # Получаем URL для загрузки видео
+        # Получаем URL для загрузки
         params = {
             "access_token": VK_GROUP_TOKEN,
             "v": "5.131",
-            "name": title[:100],  # VK ограничивает название 100 символами
-            "group_id": VK_GROUP_ID,
-            "description": f"Видео из Telegram от {datetime.now().strftime('%d.%m.%Y')}"
+            "name": title[:100],
+            "group_id": abs(int(VK_GROUP_ID)),
+            "description": f"Видео из Telegram"
         }
         
         response = requests.get(
@@ -135,203 +284,256 @@ def upload_video_to_vk(video_url: str, title: str = "Video") -> dict:
         
         result = response.json()
         if "error" in result:
-            logger.error(f"Ошибка получения URL для видео: {result['error']['error_msg']}")
+            logger.error(f"Ошибка получения URL: {result['error']['error_msg']}")
             return None
         
         upload_data = result["response"]
         
-        # Проверяем наличие upload_url
         if "upload_url" not in upload_data:
-            logger.error("Нет upload_url в ответе VK API")
+            logger.error("Нет upload_url в ответе")
             return None
-            
-        upload_url = upload_data["upload_url"]
-        
-        # Скачиваем видео потоково
-        video_response = requests.get(video_url, stream=True, timeout=300)
-        video_response.raise_for_status()
         
         # Загружаем видео
-        files = {"video_file": ("video.mp4", video_response.raw, "video/mp4")}
-        upload_response = requests.post(upload_url, files=files, timeout=600)
-        upload_response.raise_for_status()
+        with open(video_path, 'rb') as f:
+            files = {"video_file": f}
+            upload_response = requests.post(
+                upload_data["upload_url"], 
+                files=files, 
+                timeout=600
+            )
+            upload_response.raise_for_status()
         
-        upload_result = upload_response.json()
+        return f"video{upload_data['owner_id']}_{upload_data['video_id']}"
         
-        if "error" in upload_result:
-            logger.error(f"Ошибка загрузки видео: {upload_result['error']['error_msg']}")
-            return None
-        
-        # Возвращаем данные с правильными ключами
-        return {
-            "owner_id": upload_data["owner_id"],
-            "video_id": upload_data["video_id"]
-        }
-        
-    except requests.exceptions.Timeout:
-        logger.error(f"Таймаут при загрузке видео {video_url}")
-        return None
     except requests.exceptions.RequestException as e:
         logger.error(f"Сетевая ошибка при загрузке видео: {e}")
         return None
     except Exception as e:
-        logger.error(f"Критическая ошибка загрузки видео: {e}")
+        logger.error(f"Ошибка загрузки видео {video_path}: {e}")
         return None
 
-def format_telegram_date(timestamp: int) -> str:
-    """Форматирует дату из Telegram в читаемый формат."""
-    if timestamp is None:
-        return "Неизвестно"
-    dt = datetime.fromtimestamp(timestamp)
-    return dt.strftime("%d.%m.%Y %H:%M")
-
-def publish_to_vk(text: str, media_urls: list, video_url: str = None, telegram_date: int = None):
-    """Публикует пост во ВКонтакте с фото и/или видео и датой публикации."""
+def publish_to_vk(text: str, media_paths: List[str], video_path: Optional[str] = None, 
+                  date: Optional[str] = None) -> bool:
+    """Публикует пост в VK"""
     attachments = []
     
-    # Добавляем дату публикации в конец текста
-    if telegram_date is not None:
-        date_str = format_telegram_date(telegram_date)
-        text += f"\n\n📅 {date_str}"
+    # Добавляем дату
+    if date:
+        text += f"\n\n📅 {date}"
     
-    # Обрабатываем фото
-    for url in media_urls:
-        if url is not None:
-            try:
-                photo_data = upload_photo_to_vk(url)
-                if photo_data:
-                    attachments.append(f"photo{photo_data['owner_id']}_{photo_data['id']}")
-                    logger.info(f"Фото {url} успешно загружено")
-            except Exception as e:
-                logger.error(f"Ошибка обработки фото {url}: {e}")
+    # Загружаем фото (не более 10 фото на пост)
+    for photo_path in media_paths[:10]:
+        attachment = upload_photo_to_vk(photo_path)
+        if attachment:
+            attachments.append(attachment)
+            logger.info(f"✅ Загружено фото: {os.path.basename(photo_path)}")
     
-    # Обрабатываем видео
-    if video_url is not None:
-        try:
-            video_data = upload_video_to_vk(video_url, text[:50] if text else "Video")
-            if video_data:
-                video_attachment = f"video{video_data['owner_id']}_{video_data['video_id']}"
-                attachments.append(video_attachment)
-                logger.info(f"Видео успешно загружено")
-        except Exception as e:
-            logger.error(f"Ошибка обработки видео {video_url}: {e}")
-
+    # Загружаем видео (если есть)
+    if video_path:
+        attachment = upload_video_to_vk(video_path, text[:50])
+        if attachment:
+            attachments.append(attachment)
+            logger.info(f"✅ Загружено видео: {os.path.basename(video_path)}")
+    
+    # Публикуем пост
     params = {
         "access_token": VK_GROUP_TOKEN,
         "v": "5.131",
-        "owner_id": -abs(VK_GROUP_ID),  # Отрицательное для групп
-        "message": text,
-        "from_group": 1  # Публикуем от имени группы
+        "owner_id": -abs(int(VK_GROUP_ID)),
+        "message": text[:10000],  # VK ограничение
+        "from_group": 1
     }
-
+    
     if attachments:
         params["attachments"] = ",".join(attachments)
-
+    
     try:
         response = requests.post(
             "https://api.vk.com/method/wall.post",
             data=params,
-            timeout=(30, 120)
+            timeout=30
         )
         response.raise_for_status()
         result = response.json()
-
+        
         if "error" in result:
-            error_msg = result["error"]["error_msg"]
-            logger.error(f"Ошибка публикации поста: {error_msg}")
+            logger.error(f"Ошибка публикации: {result['error']['error_msg']}")
             return False
         
-        logger.info("✅ Пост успешно опубликован во ВКонтакте!")
+        logger.info(f"✅ Пост опубликован в VK")
         return True
-
-    except requests.exceptions.Timeout:
-        logger.error("Таймаут при публикации поста")
-        return False
+        
     except requests.exceptions.RequestException as e:
-        logger.error(f"Сетевая ошибка при публикации поста: {e}")
+        logger.error(f"Сетевая ошибка при публикации: {e}")
         return False
     except Exception as e:
-        logger.error(f"Неожиданная ошибка при публикации поста: {e}")
+        logger.error(f"Ошибка публикации: {e}")
         return False
 
-async def process_media(post):
-    """Обрабатывает медиафайлы из поста."""
-    media_urls = []
-    video_url = None
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает полученный ZIP файл"""
+    # Проверяем наличие необходимых переменных
+    if not all([TELEGRAM_BOT_TOKEN, VK_GROUP_TOKEN, VK_GROUP_ID]):
+        await update.message.reply_text("❌ Ошибка конфигурации бота. Проверьте переменные окружения.")
+        return
+    
+    document = update.message.document
+    
+    # Проверяем расширение
+    if not document.file_name or not document.file_name.endswith('.zip'):
+        await update.message.reply_text("❌ Пожалуйста, отправьте ZIP-архив")
+        return
+    
+    # Проверяем размер файла (максимум 50 МБ)
+    if document.file_size > 50 * 1024 * 1024:
+        await update.message.reply_text("❌ Файл слишком большой. Максимальный размер: 50 МБ")
+        return
+    
+    status_msg = await update.message.reply_text("📥 Получен архив, начинаю распаковку...")
+    
+    # Создаем уникальную папку для этого пользователя
+    user_dir = os.path.join(TEMP_DIR, str(update.effective_user.id))
+    os.makedirs(user_dir, exist_ok=True)
     
     try:
-        # Обрабатываем фото
-        if hasattr(post, 'photo') and post.photo:
-            try:
-                # Берем самую большую версию фото
-                photo = post.photo[-1]
-                file = await photo.get_file()
-                file_path = file.file_path
-                # Полный URL для скачивания
-                media_urls.append(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}")
-                logger.info(f"Найдено фото: {file_path}")
-            except Exception as e:
-                logger.warning(f"Не удалось получить фото: {e}")
+        # Скачиваем архив
+        file = await context.bot.get_file(document.file_id)
+        zip_path = os.path.join(user_dir, document.file_name)
+        await file.download_to_drive(zip_path)
         
-        # Обрабатываем видео
-        if hasattr(post, 'video') and post.video:
+        await status_msg.edit_text("📦 Распаковываю архив...")
+        
+        # Распаковываем архив
+        json_path = extract_zip(zip_path, user_dir)
+        export_dir = os.path.dirname(json_path)
+        
+        await status_msg.edit_text("📊 Анализирую файл...")
+        
+        # Парсим JSON
+        try:
+            messages = parse_telegram_export(json_path)
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Ошибка при анализе JSON: {str(e)}")
+            return
+        
+        if not messages:
+            await status_msg.edit_text("❌ Не найдено сообщений в файле")
+            return
+        
+        await status_msg.edit_text(
+            f"📊 Найдено {len(messages)} постов. Начинаю перенос в VK...\n"
+            f"Это может занять некоторое время."
+        )
+        
+        # Инициализируем статистику
+        context.user_data['processing'] = True
+        context.user_data['stats'] = {
+            'total': len(messages),
+            'processed': 0,
+            'success': 0,
+            'errors': 0
+        }
+        
+        # Обрабатываем каждый пост
+        for i, msg in enumerate(messages, 1):
+            if not context.user_data.get('processing', True):
+                await update.message.reply_text("⏹ Обработка остановлена пользователем")
+                break
+            
             try:
-                video = post.video
-                file = await video.get_file()
-                file_path = file.file_path
-                video_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-                logger.info(f"Найдено видео: {file_path}")
-            except Exception as e:
-                logger.warning(f"Не удалось получить видео: {e}")
+                # Извлекаем текст и медиа
+                text = format_message_text(msg)
+                media_paths, video_path = extract_media_from_message(msg, export_dir)
+                date = format_date(msg.get('date', ''))
                 
+                # Публикуем только если есть контент
+                if text or media_paths or video_path:
+                    success = publish_to_vk(text, media_paths, video_path, date)
+                else:
+                    success = False
+                    logger.info(f"Пост {i} пропущен - нет контента")
+                
+                # Обновляем статистику
+                context.user_data['stats']['processed'] += 1
+                if success:
+                    context.user_data['stats']['success'] += 1
+                else:
+                    context.user_data['stats']['errors'] += 1
+                
+                # Обновляем статус каждые 5 постов
+                if i % 5 == 0:
+                    stats_data = context.user_data['stats']
+                    await update.message.reply_text(
+                        f"🔄 Прогресс: {i}/{len(messages)}\n"
+                        f"✅ Успешно: {stats_data['success']}\n"
+                        f"❌ Ошибок: {stats_data['errors']}"
+                    )
+                
+                # Пауза между постами
+                await asyncio.sleep(2)
+                
+            except Exception as e:
+                logger.error(f"Ошибка обработки поста {i}: {e}")
+                context.user_data['stats']['errors'] += 1
+                context.user_data['stats']['processed'] += 1
+        
+        # Финальный отчет
+        stats_data = context.user_data['stats']
+        await update.message.reply_text(
+            f"✅ <b>Перенос завершен!</b>\n\n"
+            f"Всего постов: {stats_data['total']}\n"
+            f"Обработано: {stats_data['processed']}\n"
+            f"Успешно: {stats_data['success']}\n"
+            f"Ошибок: {stats_data['errors']}",
+            parse_mode='HTML'
+        )
+        
     except Exception as e:
-        logger.error(f"Ошибка при обработке медиа: {e}")
+        logger.error(f"Критическая ошибка: {e}")
+        await update.message.reply_text(f"❌ Ошибка обработки: {str(e)}")
     
-    return media_urls, video_url
+    finally:
+        # Очищаем временные файлы
+        context.user_data['processing'] = False
+        try:
+            shutil.rmtree(user_dir)
+            logger.info(f"Временные файлы удалены: {user_dir}")
+        except Exception as e:
+            logger.error(f"Ошибка при удалении временных файлов: {e}")
 
-async def main():
-    logger.info("🚀 Начинаем перенос старых постов из Telegram во ВКонтакте...")
-    
-    # Проверка наличия токенов
-    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, VK_GROUP_TOKEN, VK_GROUP_ID]):
-        logger.error("❌ Не все переменные окружения установлены!")
+def main():
+    """Запуск бота"""
+    # Проверяем наличие всех необходимых переменных
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("❌ TELEGRAM_BOT_TOKEN не установлен!")
         return
     
-    posts = await fetch_all_telegram_posts()
-    logger.info(f"📊 Найдено {len(posts)} постов для переноса")
-
-    if not posts:
-        logger.info("Нет постов для переноса")
+    if not VK_GROUP_TOKEN:
+        logger.error("❌ VK_GROUP_TOKEN не установлен!")
         return
-
-    success_count = 0
-    error_count = 0
-
-    for i, post in enumerate(posts, 1):
-        logger.info(f"📝 Обрабатываем пост {i}/{len(posts)}")
-        
-        # Получаем текст поста
-        text = post.text or post.caption or ""
-        telegram_date = post.date
-        
-        # Обрабатываем медиа
-        media_urls, video_url = await process_media(post)
-        
-        logger.info(f"Текст: {text[:50]}..." if text else "Без текста")
-        logger.info(f"Медиа: {len(media_urls)} фото, видео: {'да' if video_url else 'нет'}")
-
-        # Публикуем в VK
-        success = publish_to_vk(text, media_urls, video_url, telegram_date)
-        
-        if success:
-            success_count += 1
-        else:
-            error_count += 1
-
-        # Увеличенная пауза для видео
-        await asyncio.sleep(5)
-
-    logger.info(f"✨ Перенос завершён! Успешно: {success_count}, с ошибками: {error_count}")
+    
+    if not VK_GROUP_ID:
+        logger.error("❌ VK_GROUP_ID не установлен!")
+        return
+    
+    try:
+        # Проверяем, что VK_GROUP_ID можно преобразовать в число
+        int(VK_GROUP_ID)
+    except ValueError:
+        logger.error("❌ VK_GROUP_ID должен быть числом!")
+        return
+    
+    # Создаем приложение
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Добавляем обработчики
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+    logger.info("🚀 Бот запущен...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
