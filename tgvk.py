@@ -12,21 +12,39 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
 # Настройка логирования
-logging.basicFormat = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-logging.basicConfig(level=logging.INFO, format=logging.basicFormat)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Конфигурация
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 VK_GROUP_TOKEN = os.getenv("VK_GROUP_TOKEN")
 VK_GROUP_ID = os.getenv("VK_GROUP_ID")
+ADMIN_ID = os.getenv("ADMIN_ID")  # ID администратора (можно несколько через запятую)
 
 # Создаем директорию для временных файлов
-TEMP_DIR = "data\temp_media"
+TEMP_DIR = "temp_media"
 os.makedirs(TEMP_DIR, exist_ok=True)
+
+def is_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь администратором"""
+    if not ADMIN_ID:
+        return False
+    
+    # Разделяем строку с ID админов (поддерживает несколько ID через запятую)
+    admin_ids = [int(id.strip()) for id in ADMIN_ID.split(',') if id.strip().isdigit()]
+    return user_id in admin_ids
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ У вас нет прав для использования этого бота.")
+        return
+    
     help_text = (
         "🤖 <b>Бот для переноса постов из Telegram в VK</b>\n\n"
         "📤 <b>Как использовать:</b>\n"
@@ -46,6 +64,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает статистику текущей обработки"""
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ У вас нет прав для использования этого бота.")
+        return
+    
     if 'stats' in context.user_data:
         stats_data = context.user_data['stats']
         text = (
@@ -62,6 +86,12 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отменяет текущую обработку"""
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ У вас нет прав для использования этого бота.")
+        return
+    
     if 'processing' in context.user_data:
         context.user_data['processing'] = False
         await update.message.reply_text("✅ Обработка отменена")
@@ -372,6 +402,14 @@ def publish_to_vk(text: str, media_paths: List[str], video_path: Optional[str] =
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает полученный ZIP файл"""
+    user_id = update.effective_user.id
+    
+    # Проверяем права доступа
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ У вас нет прав для использования этого бота.")
+        logger.warning(f"Попытка доступа неавторизованного пользователя: {user_id}")
+        return
+    
     # Проверяем наличие необходимых переменных
     if not all([TELEGRAM_BOT_TOKEN, VK_GROUP_TOKEN, VK_GROUP_ID]):
         await update.message.reply_text("❌ Ошибка конфигурации бота. Проверьте переменные окружения.")
@@ -384,15 +422,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Пожалуйста, отправьте ZIP-архив")
         return
     
-    # Проверяем размер файла (максимум 50 МБ)
-    if document.file_size > 50 * 1024 * 1024:
-        await update.message.reply_text("❌ Файл слишком большой. Максимальный размер: 50 МБ")
-        return
+    # Проверяем размер файла (предупреждаем, но не блокируем)
+    if document.file_size > 100 * 1024 * 1024:  # 100 МБ
+        await update.message.reply_text(
+            f"⚠️ Файл очень большой ({document.file_size / 1024 / 1024:.1f} МБ). "
+            f"Обработка может занять длительное время."
+        )
     
     status_msg = await update.message.reply_text("📥 Получен архив, начинаю распаковку...")
     
     # Создаем уникальную папку для этого пользователя
-    user_dir = os.path.join(TEMP_DIR, str(update.effective_user.id))
+    user_dir = os.path.join(TEMP_DIR, str(user_id))
     os.makedirs(user_dir, exist_ok=True)
     
     try:
@@ -516,12 +556,31 @@ def main():
         logger.error("❌ VK_GROUP_ID не установлен!")
         return
     
+    if not ADMIN_ID:
+        logger.error("❌ ADMIN_ID не установлен! Бот будет доступен только администраторам.")
+        return
+    
     try:
         # Проверяем, что VK_GROUP_ID можно преобразовать в число
         int(VK_GROUP_ID)
     except ValueError:
         logger.error("❌ VK_GROUP_ID должен быть числом!")
         return
+    
+    # Проверяем ADMIN_ID
+    admin_ids = [id.strip() for id in ADMIN_ID.split(',') if id.strip()]
+    valid_admins = []
+    for admin_id in admin_ids:
+        try:
+            valid_admins.append(int(admin_id))
+        except ValueError:
+            logger.warning(f"❌ Неверный формат ADMIN_ID: {admin_id} - должен быть числом")
+    
+    if not valid_admins:
+        logger.error("❌ Нет валидных ID администраторов!")
+        return
+    
+    logger.info(f"✅ Администраторы бота: {valid_admins}")
     
     # Создаем приложение
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
