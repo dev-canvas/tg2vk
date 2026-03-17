@@ -191,7 +191,7 @@ def publish_to_vk(text: str, media_urls: list, video_url: str = None, telegram_d
         response = requests.post(
             "https://api.vk.com/method/wall.post",
             data=params,
-            timeout(30, 60)  # Таймауты: соединение 30 с, чтение 60 с
+            timeout=(30, 60)  # Таймауты: соединение 30 с, чтение 60 с
         )
         response.raise_for_status()
         result = response.json()
