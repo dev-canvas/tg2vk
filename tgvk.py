@@ -267,7 +267,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"✅ Архив #{len(context.user_data['archives'])} сохранен!\n"
             f"📁 Тип: <b>{archive_type}</b>\n"
-            f"📦 Файлов: {len(os.listdir(os.path.join(archive_dir, 'files')))} в папке files\n\n"
+            f"📦 Файлов: {len(os.listdir(os.path.join(archive_dir, 'files'))) if os.path.exists(os.path.join(archive_dir, 'files')) else 0} в папке files\n\n"
             f"Всего архивов в сессии: {len(context.user_data['archives'])}\n"
             f"Используйте /process для обработки всех архивов.",
             parse_mode='HTML'
@@ -449,9 +449,8 @@ def main():
     app.add_handler(CommandHandler("process", process_archives))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
-    logger.info("🚀 Бот запущен...")
+    logger.info("🚀 Бот запущен1...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
-
